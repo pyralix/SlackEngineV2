@@ -1,2 +1,4 @@
-﻿/simplified_config.json
+﻿/config.json
 /service-account.json
+/.env
+/slack_bot.log

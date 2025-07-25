@@ -13,12 +13,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from gcs_tools import upload_json_to_gcs
 
 import requests
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
 from slack_bolt.async_app import AsyncSay
 
+from gemini_tools import analyze_log_vertexai_with_json, remove_friendly_response_field
 from session_manager import SessionManager
 from agent_engine_client import AgentEngineClient
 
@@ -148,68 +150,66 @@ class EnhancedSlackMessageHandler:
                 )
             except Exception:
                 pass
-    
+
     async def handle_reaction_added(self, event: dict, client: AsyncWebClient):
         """
-        Handle reaction_added events for bot messages.
-        
-        When a reaction is added to a message sent by the bot,
-        log the entire thread to a file in the 'logs' directory for human review.
-        
-        Args:
-            event: Slack reaction_added event
-            client: Slack web client
+        When a reaction is added to a bot-authored message (root or thread), log the entire thread.
         """
         try:
             # Get bot user ID if not cached
             if not self.bot_user_id:
-                try:
-                    auth_response = await client.auth_test()
-                    self.bot_user_id = auth_response["user_id"]
-                except SlackApiError as e:
-                    self.logger.error(f"Cannot get bot user ID for reaction handling: {e}")
-                    return
-            
-            # Check if reaction was added to a bot message
-            reacted_message = event.get("item", {})
-            if reacted_message.get("type") != "message":
+                auth_response = await client.auth_test()
+                self.bot_user_id = auth_response["user_id"]
+
+            reacted_item = event.get("item", {})
+            if reacted_item.get("type") != "message":
                 return
-            
-            channel = reacted_message.get("channel")
-            message_ts = reacted_message.get("ts")
-            
+
+            channel = reacted_item.get("channel")
+            message_ts = reacted_item.get("ts")
             if not channel or not message_ts:
                 return
-            
-            # Get the original message to check if it's from the bot
+
+            # Try to get the message via conversations_history (root) or conversations_replies (thread)
+            original_message = None
             try:
-                response = await client.conversations_history(
-                    channel=channel,
-                    oldest=message_ts,
-                    latest=message_ts,
-                    inclusive=True,
-                    limit=1
+                # Try history (may hit parent only)
+                resp = await client.conversations_history(
+                    channel=channel, oldest=message_ts, latest=message_ts, inclusive=True, limit=1
                 )
-                
-                messages = response.get("messages", [])
-                if not messages:
+                candidates = resp.get("messages", [])
+                if candidates:
+                    original_message = candidates[0]
+                else:
+                    # Try as thread (may be reply)
+                    resp = await client.conversations_replies(channel=channel, ts=message_ts)
+                    candidates = resp.get("messages", [])
+                    # Look for a message with ts == message_ts
+                    for m in candidates:
+                        if m.get("ts") == message_ts:
+                            original_message = m
+                            break
+
+                if not original_message:
+                    self.logger.warning(f"Could not find message {message_ts} in channel {channel}")
                     return
-                
-                original_message = messages[0]
-                if original_message.get("user") != self.bot_user_id:
-                    # Not a bot message, ignore
-                    return
-                
             except SlackApiError as e:
-                self.logger.error(f"Error fetching original message: {e}")
+                self.logger.error(f"Cannot fetch reacted message: {e}")
                 return
-            
-            # This is a reaction to a bot message - log the thread
-            await self._log_thread_for_review(client, channel, message_ts, event)
-            
-        except Exception as e:
+
+            if original_message.get("user") != self.bot_user_id:
+                # Not a bot message, ignore.
+                return
+
+            # Determine thread root
+            thread_ts = original_message.get("thread_ts") or original_message.get("ts")
+
+            # Log the WHOLE thread for this reaction
+            await self._log_thread_for_review(client, channel, thread_ts, event)
+
+        except Exception:
             self.logger.exception("Error handling reaction_added event")
-    
+
     async def _get_thread_context(self, client: AsyncWebClient, channel: str, thread_ts: str) -> str:
         """
         Fetch all messages in thread for context.
@@ -335,6 +335,41 @@ class EnhancedSlackMessageHandler:
                 json.dump(log_data, f, indent=2, ensure_ascii=False)
             
             self.logger.info(f"Logged thread with reaction to: {log_file_path}")
-            
+            self.logger.info(f"Sending to Gemini for analysis")
+            reaction_response = analyze_log_vertexai_with_json(log_data)
+
+            try:
+                # Extract the friendly message for user feedback from the Gemini output
+                friendly_message = reaction_response.get("friendly_response_to_user")
+                if friendly_message:
+                    # Find the thread timestamp and react in that thread
+                    await client.chat_postMessage(
+                        channel=channel,
+                        text=friendly_message,
+                        thread_ts=thread_ts
+                    )
+                    self.logger.info(f"Posted friendly feedback message to thread {thread_ts}")
+                else:
+                    self.logger.warning(f"No 'friendly_response_to_user' generated for thread {thread_ts}")
+            except Exception as feedback_exc:
+                self.logger.error(f"Failed to post feedback message: {feedback_exc}")
+
+
+            try:
+                cleaned_log = remove_friendly_response_field(reaction_response)
+
+                learning_filename = f"learning_{timestamp_str}_{channel}_{thread_ts.replace('.', '_')}.json"
+
+                # Use the bot's name as the GCS "folder"
+                # Example: bot_name comes from config.slack_bot.name (pass to EnhancedSlackMessageHandler at startup)
+                gcs_folder = self.bot_name
+
+                upload_json_to_gcs(cleaned_log, learning_filename, gcs_folder)
+
+                self.logger.info(
+                    f"Uploaded learning log for thread {thread_ts} to GCS at {gcs_folder}/{learning_filename}")
+            except Exception as upload_exc:
+                self.logger.error(f"Failed to upload learning log to GCS: {upload_exc}")
+
         except Exception as e:
             self.logger.error(f"Error logging thread for review: {e}")

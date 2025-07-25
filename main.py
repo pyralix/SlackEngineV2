@@ -12,8 +12,8 @@ import signal
 import sys
 from pathlib import Path
 
-from simplified_config_loader import load_config
-from simplified_slack_bot_fixed import SlackBot
+from config_loader import load_config
+from slack_bot import SlackBot
 
 
 def setup_logging(log_level: str = "INFO"):
