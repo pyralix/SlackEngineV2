@@ -1,0 +1,340 @@
+"""
+Enhanced Slack message handler with reaction logging support.
+
+This extends the original message handler to include reaction_added event handling
+that logs complete threads to files in the 'logs' directory for human review.
+"""
+
+import json
+import logging
+import re
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import requests
+from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.errors import SlackApiError
+from slack_bolt.async_app import AsyncSay
+
+from session_manager import SessionManager
+from agent_engine_client import AgentEngineClient
+
+
+def markdown_to_slack(text: str) -> str:
+    """Convert markdown formatting to Slack-compatible formatting."""
+    # Convert double asterisks to single for bold
+    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    
+    # Flatten nested bullets (replace ' *' with '• ')
+    text = re.sub(r'^\s*\*\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r' {4,}[*-] ', ' - ', text)
+    
+    # Convert Markdown link [text](url) to Slack's <url|text>
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
+    
+    # Remove excessive newlines (keep one for paragraphs)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text.strip()
+
+
+class EnhancedSlackMessageHandler:
+    """
+    Enhanced Slack message handler with reaction logging.
+    
+    Handles incoming Slack messages and logs threads when reactions
+    are added to bot messages for human review.
+    """
+    
+    def __init__(self, session_mgr: SessionManager, agent_client: AgentEngineClient, bot_name: str):
+        """
+        Initialize the enhanced message handler.
+        
+        Args:
+            session_mgr: Session manager instance
+            agent_client: Agent engine client instance
+            bot_name: Name of the bot for logging purposes
+        """
+        self.session_mgr = session_mgr
+        self.agent_client = agent_client
+        self.bot_name = bot_name
+        self.logger = logging.getLogger(f"{__name__}.{bot_name}")
+        self.bot_user_id: Optional[str] = None
+        
+        # Create logs directory if it doesn't exist
+        self.logs_dir = Path("logs")
+        self.logs_dir.mkdir(exist_ok=True)
+        
+        self.logger.info(f"Enhanced message handler initialized for {bot_name}")
+    
+    async def handle_message(self, event: dict, say: AsyncSay, client: AsyncWebClient):
+        """
+        Handle Slack 'message' event with enhanced logic.
+        
+        Rules:
+        1. If DM (channel_type == "im"), respond to every message in thread.
+        2. If channel/group, respond ONLY if message mentions the bot.
+        3. Always respond in thread.
+        
+        Args:
+            event: Slack message event
+            say: AsyncSay callable for responses
+            client: Slack web client
+        """
+        try:
+            # Cache bot user ID on first message
+            if not self.bot_user_id:
+                try:
+                    auth_response = await client.auth_test()
+                    self.bot_user_id = auth_response["user_id"]
+                    self.logger.info(f"Bot user ID: {self.bot_user_id}")
+                except SlackApiError as e:
+                    self.logger.error(f"Cannot get bot user ID: {e}")
+                    return
+            
+            # Ignore bot messages to prevent loops
+            if event.get("subtype") == "bot_message":
+                return
+            
+            text = event.get("text", "").strip()
+            user_id = event.get("user")
+            if not text or not user_id:
+                return
+            
+            channel = event["channel"]
+            thread_ts = event.get("thread_ts") or event["ts"]
+            channel_type = event.get("channel_type", "")
+            
+            # Determine if we should respond
+            should_respond = False
+            if channel_type == "im":
+                # DM: Always respond
+                should_respond = True
+            else:
+                # Channel/group: Only respond if bot is mentioned
+                should_respond = f"<@{self.bot_user_id}>" in text
+            
+            if not should_respond:
+                return
+            
+            self.logger.info(f"Processing message from {user_id} in {channel}: {text[:100]}...")
+            
+            # Get thread context
+            context = await self._get_thread_context(client, channel, thread_ts)
+            if not context:
+                await say(
+                    text="❌ Could not retrieve conversation context.",
+                    thread_ts=thread_ts,
+                )
+                return
+            
+            # Track session
+            self.session_mgr.get_or_create_session(channel, thread_ts)
+            self.session_mgr.update_last_used(channel, thread_ts)
+            
+            # Stream response from Agent Engine
+            await self._stream_agent_response(context, user_id, thread_ts, say)
+            
+        except Exception as e:
+            self.logger.exception("Error handling Slack message")
+            try:
+                await say(
+                    text="⚠️ An error occurred while processing your message.",
+                    thread_ts=event.get("thread_ts") or event.get("ts"),
+                )
+            except Exception:
+                pass
+    
+    async def handle_reaction_added(self, event: dict, client: AsyncWebClient):
+        """
+        Handle reaction_added events for bot messages.
+        
+        When a reaction is added to a message sent by the bot,
+        log the entire thread to a file in the 'logs' directory for human review.
+        
+        Args:
+            event: Slack reaction_added event
+            client: Slack web client
+        """
+        try:
+            # Get bot user ID if not cached
+            if not self.bot_user_id:
+                try:
+                    auth_response = await client.auth_test()
+                    self.bot_user_id = auth_response["user_id"]
+                except SlackApiError as e:
+                    self.logger.error(f"Cannot get bot user ID for reaction handling: {e}")
+                    return
+            
+            # Check if reaction was added to a bot message
+            reacted_message = event.get("item", {})
+            if reacted_message.get("type") != "message":
+                return
+            
+            channel = reacted_message.get("channel")
+            message_ts = reacted_message.get("ts")
+            
+            if not channel or not message_ts:
+                return
+            
+            # Get the original message to check if it's from the bot
+            try:
+                response = await client.conversations_history(
+                    channel=channel,
+                    oldest=message_ts,
+                    latest=message_ts,
+                    inclusive=True,
+                    limit=1
+                )
+                
+                messages = response.get("messages", [])
+                if not messages:
+                    return
+                
+                original_message = messages[0]
+                if original_message.get("user") != self.bot_user_id:
+                    # Not a bot message, ignore
+                    return
+                
+            except SlackApiError as e:
+                self.logger.error(f"Error fetching original message: {e}")
+                return
+            
+            # This is a reaction to a bot message - log the thread
+            await self._log_thread_for_review(client, channel, message_ts, event)
+            
+        except Exception as e:
+            self.logger.exception("Error handling reaction_added event")
+    
+    async def _get_thread_context(self, client: AsyncWebClient, channel: str, thread_ts: str) -> str:
+        """
+        Fetch all messages in thread for context.
+        
+        Args:
+            client: Slack web client
+            channel: Channel ID
+            thread_ts: Thread timestamp
+            
+        Returns:
+            Formatted thread context string
+        """
+        try:
+            history = await client.conversations_replies(channel=channel, ts=thread_ts)
+            messages = []
+            
+            for msg in history.get("messages", []):
+                text = msg.get("text", "").strip()
+                user = msg.get("user")
+                if text and user and msg.get("subtype") != "bot_message":
+                    messages.append(f"<@{user}>: {text}")
+            
+            return "\n".join(messages)
+            
+        except SlackApiError as e:
+            self.logger.error(f"Error fetching thread context: {e}")
+            return ""
+    
+    async def _stream_agent_response(self, context: str, user_id: str, thread_ts: str, say: AsyncSay):
+        """
+        Stream response from Agent Engine and send final reply.
+        
+        Args:
+            context: Message context to send to agent
+            user_id: User ID who sent the message
+            thread_ts: Thread timestamp for reply
+            say: AsyncSay callable for sending response
+        """
+        response_chunks = []
+        
+        try:
+            async for chunk in self.agent_client.stream_query(user_id=user_id, message=context):
+                response_chunks.append(chunk)
+                
+        except Exception as e:
+            self.logger.error(f"Agent Engine streaming error: {e}")
+            await say(
+                text="❌ Sorry, I'm having trouble connecting to the agent service.",
+                thread_ts=thread_ts
+            )
+            return
+        
+        final_response = response_chunks[-1] if response_chunks else "🤷 I don't have a response for that."
+        
+        self.logger.info(f"Sending response to {user_id}: {final_response[:100]}...")
+        await say(text=markdown_to_slack(final_response), thread_ts=thread_ts)
+    
+    async def _log_thread_for_review(self, client: AsyncWebClient, channel: str, message_ts: str, reaction_event: dict):
+        """
+        Log complete thread to file in 'logs' directory for human review.
+        
+        Args:
+            client: Slack web client
+            channel: Channel ID
+            message_ts: Message timestamp
+            reaction_event: The reaction_added event
+        """
+        try:
+            # Determine thread timestamp (could be the message itself or its thread)
+            thread_ts = message_ts
+            
+            # Get complete thread history
+            history_response = await client.conversations_replies(
+                channel=channel,
+                ts=thread_ts
+            )
+            
+            messages = history_response.get("messages", [])
+            if not messages:
+                self.logger.warning(f"No messages found for thread {thread_ts}")
+                return
+            
+            # Get channel info for context
+            try:
+                channel_info = await client.conversations_info(channel=channel)
+                channel_name = channel_info.get("channel", {}).get("name", channel)
+            except SlackApiError:
+                channel_name = channel
+            
+            # Build thread log data
+            log_data = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "bot_name": self.bot_name,
+                "channel": channel,
+                "channel_name": channel_name,
+                "thread_ts": thread_ts,
+                "reaction_event": {
+                    "user": reaction_event.get("user"),
+                    "reaction": reaction_event.get("reaction"),
+                    "event_ts": reaction_event.get("event_ts")
+                },
+                "thread_messages": []
+            }
+            
+            # Process each message in the thread
+            for msg in messages:
+                message_data = {
+                    "ts": msg.get("ts"),
+                    "user": msg.get("user"),
+                    "text": msg.get("text", ""),
+                    "subtype": msg.get("subtype"),
+                    "is_bot": msg.get("subtype") == "bot_message" or msg.get("user") == self.bot_user_id
+                }
+                log_data["thread_messages"].append(message_data)
+            
+            # Generate filename with timestamp and thread ID
+            timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            filename = f"thread_{timestamp_str}_{channel}_{thread_ts.replace('.', '_')}.json"
+            log_file_path = self.logs_dir / filename
+            
+            # Write to file
+            with open(log_file_path, 'w', encoding='utf-8') as f:
+                json.dump(log_data, f, indent=2, ensure_ascii=False)
+            
+            self.logger.info(f"Logged thread with reaction to: {log_file_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Error logging thread for review: {e}")
