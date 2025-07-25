@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from gcs_tools import upload_json_to_gcs
+from deduplication import deduplicate_event
 
 import requests
 from slack_sdk.web.async_client import AsyncWebClient
@@ -72,7 +73,8 @@ class EnhancedSlackMessageHandler:
         self.logs_dir.mkdir(exist_ok=True)
         
         self.logger.info(f"Enhanced message handler initialized for {bot_name}")
-    
+
+    @deduplicate_event()
     async def handle_message(self, event: dict, say: AsyncSay, client: AsyncWebClient):
         """
         Handle Slack 'message' event with enhanced logic.
@@ -336,7 +338,7 @@ class EnhancedSlackMessageHandler:
             
             self.logger.info(f"Logged thread with reaction to: {log_file_path}")
             self.logger.info(f"Sending to Gemini for analysis")
-            reaction_response = analyze_log_vertexai_with_json(log_data)
+            reaction_response = analyze_log_vertexai_with_json(log_data,channel_info.data["channel"]["user"])
 
             try:
                 # Extract the friendly message for user feedback from the Gemini output

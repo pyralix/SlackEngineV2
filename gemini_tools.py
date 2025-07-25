@@ -40,6 +40,7 @@ def get_project_id_from_service_account(sa_path: str = "./service-account.json")
 
 def analyze_log_vertexai_with_json(
         log_thread: str,
+        user_id: str,
         location: str = "us-central1",
         model_name: str = "gemini-2.5-flash",
         sa_path: str = "./service-account.json",  # <<--- your hardcoded relative or absolute path
@@ -64,7 +65,7 @@ def analyze_log_vertexai_with_json(
       "sentiment": "<positive|negative|neutral, as assessed>",
       "key_entities": [<key entities or topics, as short strings>],
       "should_have_done": "<What could the agent or workflow have done better to improve outcome; or 'no significant changes needed.'>",
-      "friendly_response_to_user": "<What the agent should respond to the user in first person, thanking them for their feedback. should be short and contextually appropriate. If the feedback is negative, it should very briefly tell the user what it thinks it might do better next time.>"
+      "friendly_response_to_user": "<What the agent should respond to the user in first person, thanking them for their feedback. The user's name should be addressed as `<@{user_id}>`, so that slack mentions them in your response. should be short and contextually appropriate. If the feedback is negative, it should very briefly tell the user what it thinks it might do better next time.>"
     }}
 
     Here is the complete message thread log (as raw JSON):
