@@ -1,0 +1,10 @@
+slack-sdk
+slack-bolt
+watchfiles
+pydantic
+httpx
+aiohttp
+fastapi
+google-auth
+requests
+google-cloud-storage
