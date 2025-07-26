@@ -294,19 +294,12 @@ class EnhancedSlackMessageHandler:
                 self.logger.warning(f"No messages found for thread {thread_ts}")
                 return
             
-            # Get channel info for context
-            try:
-                channel_info = await client.conversations_info(channel=channel)
-                channel_name = channel_info.get("channel", {}).get("name", channel)
-            except SlackApiError:
-                channel_name = channel
-            
             # Build thread log data
             log_data = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "bot_name": self.bot_name,
                 "channel": channel,
-                "channel_name": channel_name,
+                "channel_name": channel,
                 "thread_ts": thread_ts,
                 "reaction_event": {
                     "user": reaction_event.get("user"),
@@ -338,7 +331,7 @@ class EnhancedSlackMessageHandler:
             
             self.logger.info(f"Logged thread with reaction to: {log_file_path}")
             self.logger.info(f"Sending to Gemini for analysis")
-            reaction_response = analyze_log_vertexai_with_json(log_data,channel_info.data["channel"]["user"])
+            reaction_response = analyze_log_vertexai_with_json(log_data,reaction_event.get("user"))
 
             try:
                 # Extract the friendly message for user feedback from the Gemini output

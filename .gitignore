@@ -2,3 +2,4 @@
 /service-account.json
 /.env
 /slack_bot.log
+/.idea/
