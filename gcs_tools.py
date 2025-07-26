@@ -21,30 +21,27 @@ def get_gcs_client():
     creds = service_account.Credentials.from_service_account_file(sa_path)
     return storage.Client(credentials=creds)
 
-def json_to_jsonl(json_str):
+def json_to_jsonl(data):
     """
-    Convert JSON array or wrapped-list dict to a JSONL string.
-    Each object will be on its own line in the output.
+    Accepts a list of dicts or a dict containing one list as a value.
+    Returns a JSONL (newline-delimited) string.
     """
-    data = json.loads(json_str)
-
-    # If the root is a list, treat each element as a record
+    if isinstance(data, str):
+        data = json.loads(data)
     if isinstance(data, list):
         lines = [json.dumps(obj, ensure_ascii=False) for obj in data]
         return '\n'.join(lines)
-    # If the root is a dict with a single list value (e.g. {"records": [...]})
     elif isinstance(data, dict):
-        # Look for a single key that is a list
         array_keys = [k for k, v in data.items() if isinstance(v, list)]
         if len(array_keys) == 1:
             records = data[array_keys[0]]
             lines = [json.dumps(obj, ensure_ascii=False) for obj in records]
             return '\n'.join(lines)
         else:
-            # Fallback: treat the entire dict as a single JSONL line
             return json.dumps(data, ensure_ascii=False)
     else:
-        raise ValueError("JSON root must be array or object.")
+        raise ValueError("Input must be list, dict, or JSON string.")
+
 
 
 def upload_json_to_gcs(json_data, filename, bucket_path):
