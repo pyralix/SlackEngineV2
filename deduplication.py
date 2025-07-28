@@ -83,8 +83,21 @@ def deduplicate_event(
                     dedup_key = f"client_msg_id:{cid}"
                     label = "client_msg_id"
                 else:
-                    dedup_key = None
-                    label = None
+                    assistant_thread = event.get('assistant_thread')
+                    tid = None
+                    if assistant_thread is not None:
+                        tid = assistant_thread.get('thread_ts')
+                    if tid:
+                        dedup_key = f"thread_id:{tid}"
+                        label = "thread_id"
+                    else:
+                        ets = event.get('event_ts')
+                        if ets:
+                            dedup_key = f"event_ts:{ets}"
+                            label = "event_ts"
+                        else:
+                            dedup_key = None
+                            label = None
 
             if dedup_key:
                 if await DEDUPLICATOR.is_duplicate(dedup_key):
