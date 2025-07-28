@@ -4,7 +4,7 @@ Enhanced Slack message handler with reaction logging support.
 This extends the original message handler to include reaction_added event handling
 that logs complete threads to files in the 'logs' directory for human review.
 """
-
+import asyncio
 import json
 import logging
 import re
@@ -25,6 +25,22 @@ from gemini_tools import analyze_log_vertexai_with_json, remove_friendly_respons
 from session_manager import SessionManager
 from agent_engine_client import AgentEngineClient
 
+
+def extract_last_user_message(context: str, user_id: str) -> str:
+    """
+    Extract the latest message text authored by the user from the conversation context.
+    Assumes context is a sequence of lines like: <@USERID>: message
+
+    Args:
+        context (str): Full conversation history as one string.
+        user_id (str): The Slack user ID whose message to extract.
+
+    Returns:
+        str: The most recent message text sent by the user, or "" if not found.
+    """
+    user_pattern = re.compile(rf'^<@{re.escape(user_id)}>\s*:\s*(.+)$', re.MULTILINE)
+    matches = user_pattern.findall(context)
+    return matches[-1].strip() if matches else ""
 
 def markdown_to_slack(text: str) -> str:
     """
@@ -263,23 +279,33 @@ class EnhancedSlackMessageHandler:
             self.logger.error(f"Error fetching thread context: {e}")
             return ""
 
-    # slack_message_handler.py (within EnhancedSlackMessageHandler)
-
-    async def _stream_agent_response(self, context: str, user_id: str, thread_ts: str, say: AsyncSay):
+    async def _stream_agent_response(self, context: str, user_id: str, thread_ts: str, say: 'AsyncSay'):
         """
         Stream response from Agent Engine and send final reply.
-        Now sends a quick 'working' message right after receiving the user's prompt.
+
+        Only send the quick "I'm working" response if the user message is longer than 80 characters.
+        Generates it asynchronously using asyncio.to_thread to avoid blocking the event loop.
+        :type user_id: str
         """
-        # First, send quick working response
-        try:
-            from gemini_tools import quick_working_response
-            quick_msg = quick_working_response(context, user_id)
-            if quick_msg:
-                await say(text=quick_msg, thread_ts=thread_ts)
-        except Exception as e:
-            self.logger.error(f"Quick working response generation failed: {e}")
-            # Optionally: fallback to a hardcoded generic message
-            await say(text=f"<@{user_id}> I'm working on your request!", thread_ts=thread_ts)
+        MIN_QUICK_RESPONSE_LEN = 30  # You can make this configurable
+
+        # Only trigger for long messages
+        user_msg = extract_last_user_message(context, user_id)
+        if len(user_msg) > MIN_QUICK_RESPONSE_LEN:
+            try:
+                from gemini_tools import quick_working_response
+
+                # Run the blocking Gemini model call in a worker thread
+                quick_msg = await asyncio.to_thread(quick_working_response, context, user_id)
+                if quick_msg:
+                    await say(text=quick_msg, thread_ts=thread_ts)
+            except Exception as e:
+                self.logger.error(f"Quick working response generation failed: {e}")
+                # Optionally: fallback to a generic message
+                try:
+                    await say(text=f"<@{user_id}> I'm working on your request!", thread_ts=thread_ts)
+                except Exception:
+                    self.logger.error("Failed to send fallback working message.")
 
         # Proceed as before to stream the actual agent response
         response_chunks = []
@@ -297,7 +323,6 @@ class EnhancedSlackMessageHandler:
         final_response = response_chunks[-1] if response_chunks else "🤷 I don't have a response for that."
         self.logger.info(f"Sending response to {user_id}: {final_response[:100]}...")
         await say(text=markdown_to_slack(final_response), thread_ts=thread_ts)
-
 
     async def _log_thread_for_review(self, client: AsyncWebClient, channel: str, message_ts: str, reaction_event: dict):
         """
