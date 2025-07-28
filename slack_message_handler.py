@@ -27,21 +27,44 @@ from agent_engine_client import AgentEngineClient
 
 
 def markdown_to_slack(text: str) -> str:
-    """Convert markdown formatting to Slack-compatible formatting."""
-    # Convert double asterisks to single for bold
+    """
+    Convert Markdown formatting to Slack-compatible formatting.
+
+    - Converts bold (`**bold**`) to Slack's `*bold*`
+    - Converts headings (`# Heading`) to bold lines for visual emphasis
+    - Converts bullets and numbered lists to bullet points
+    - Converts `[text](url)` links to Slack `<url|text>`
+    - Removes excessive newlines
+
+    Args:
+        text (str): Input string in Markdown format.
+
+    Returns:
+        str: Slack-formatted message.
+    """
+    if not text:
+        return ""
+
+    # Convert Markdown headings (#, ##, ###) to bold, handles up to ######
+    def heading_repl(match):
+        content = match.group(2).strip()
+        return f"\n*{content}*\n"
+    text = re.sub(r'^(#{1,6})\s+(.*)', heading_repl, text, flags=re.MULTILINE)
+
+    # Convert double asterisks to Slack's bold
     text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
-    
-    # Flatten nested bullets (replace ' *' with '• ')
+
+    # Flatten nested bullets (replace list starts with • )
     text = re.sub(r'^\s*\*\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r' {4,}[*-] ', ' - ', text)
-    
-    # Convert Markdown link [text](url) to Slack's <url|text>
+
+    # Convert Markdown links to Slack format
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
-    
-    # Remove excessive newlines (keep one for paragraphs)
+
+    # Remove excessive newlines (keep a max of 2)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    
+
     return text.strip()
 
 
@@ -239,23 +262,30 @@ class EnhancedSlackMessageHandler:
         except SlackApiError as e:
             self.logger.error(f"Error fetching thread context: {e}")
             return ""
-    
+
+    # slack_message_handler.py (within EnhancedSlackMessageHandler)
+
     async def _stream_agent_response(self, context: str, user_id: str, thread_ts: str, say: AsyncSay):
         """
         Stream response from Agent Engine and send final reply.
-        
-        Args:
-            context: Message context to send to agent
-            user_id: User ID who sent the message
-            thread_ts: Thread timestamp for reply
-            say: AsyncSay callable for sending response
+        Now sends a quick 'working' message right after receiving the user's prompt.
         """
+        # First, send quick working response
+        try:
+            from gemini_tools import quick_working_response
+            quick_msg = quick_working_response(context, user_id)
+            if quick_msg:
+                await say(text=quick_msg, thread_ts=thread_ts)
+        except Exception as e:
+            self.logger.error(f"Quick working response generation failed: {e}")
+            # Optionally: fallback to a hardcoded generic message
+            await say(text=f"<@{user_id}> I'm working on your request!", thread_ts=thread_ts)
+
+        # Proceed as before to stream the actual agent response
         response_chunks = []
-        
         try:
             async for chunk in self.agent_client.stream_query(user_id=user_id, message=context):
                 response_chunks.append(chunk)
-                
         except Exception as e:
             self.logger.error(f"Agent Engine streaming error: {e}")
             await say(
@@ -263,12 +293,12 @@ class EnhancedSlackMessageHandler:
                 thread_ts=thread_ts
             )
             return
-        
+
         final_response = response_chunks[-1] if response_chunks else "🤷 I don't have a response for that."
-        
         self.logger.info(f"Sending response to {user_id}: {final_response[:100]}...")
         await say(text=markdown_to_slack(final_response), thread_ts=thread_ts)
-    
+
+
     async def _log_thread_for_review(self, client: AsyncWebClient, channel: str, message_ts: str, reaction_event: dict):
         """
         Log complete thread to file in 'logs' directory for human review.
