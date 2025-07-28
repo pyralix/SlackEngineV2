@@ -192,6 +192,7 @@ class EnhancedSlackMessageHandler:
             except Exception:
                 pass
 
+    @deduplicate_event()
     async def handle_reaction_added(self, event: dict, client: AsyncWebClient):
         """
         When a reaction is added to a bot-authored message (root or thread), log the entire thread.
@@ -250,6 +251,66 @@ class EnhancedSlackMessageHandler:
 
         except Exception:
             self.logger.exception("Error handling reaction_added event")
+
+    @deduplicate_event()
+    async def handle_assistant_thread_started(self, event: dict, say: AsyncSay, client: AsyncWebClient):
+        """
+        Handle the 'assistant_thread_started' event.
+
+        When a new assistant-handled thread begins, prompt the Agentengine agent to introduce itself
+        to the relevant Slack user.
+
+        Args:
+            event (dict): Event payload. Must contain 'channel', 'user', and 'ts' (thread timestamp).
+            say (AsyncSay): Slack Bolt say function.
+            client (AsyncWebClient): Slack Web API client.
+
+        Usage example:
+            await handler.handle_assistant_thread_started(event, say, client)
+
+        Edge Cases:
+            - Skips handling and warns if 'user', 'channel', or 'ts' missing in event.
+            - Catches and logs any errors from Agent Engine communication.
+        """
+        assistant_thread = event.get('assistant_thread')
+        user_id = assistant_thread.get('user_id')
+        channel = assistant_thread.get('channel_id')
+        thread_ts = assistant_thread.get('thread_ts')
+        if not user_id or not channel or not thread_ts:
+            self.logger.warning(
+                f"assistant_thread_started missing fields: user: {user_id}, channel: {channel}, ts: {thread_ts}"
+            )
+            return
+
+        # Compose introduction prompt for the agent to reply to the user.
+        introduction_prompt = (
+            f"Please introduce yourself to <@{user_id}> as an assistant in this Slack thread. "
+            "Briefly explain your capabilities and how you can help."
+        )
+
+        self.logger.info(
+            f"assistant_thread_started: Prompting Agentengine agent to introduce in channel {channel}, thread {thread_ts}, to user {user_id}"
+        )
+
+        try:
+            async for chunk in self.agent_client.stream_query(user_id=user_id, message=introduction_prompt):
+                # Only want to send the final introduction (if the agent streams, take last)
+                final_intro = chunk  # Only keep the last chunk.
+            slack_message = markdown_to_slack(final_intro)
+            await say(text=slack_message, thread_ts=thread_ts)
+            self.logger.info(
+                f"Sent agent introduction to user <@{user_id}> in thread {thread_ts}."
+            )
+        except Exception as e:
+            self.logger.error(f"Error sending agent introduction: {e}")
+            try:
+                await say(
+                    text="⚠️ Error introducing the assistant. Please try again or contact support.",
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                pass
+
 
     async def _get_thread_context(self, client: AsyncWebClient, channel: str, thread_ts: str) -> str:
         """
