@@ -52,7 +52,8 @@ class SlackBot:
             endpoint=config.agent_engine.endpoint,
             project=config.agent_engine.project,
             location=config.agent_engine.location,
-            reasoning_engine_id=config.agent_engine.reasoning_engine_id
+            reasoning_engine_id=config.agent_engine.reasoning_engine_id,
+            session_storage_path=config.agent_engine.session_storage_path
         )
         self.agent_client = AgentEngineClient(agent_config)
         

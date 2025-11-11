@@ -19,6 +19,7 @@ class AgentEngineConfig(BaseModel):
     project: str
     location: str
     reasoning_engine_id: str
+    session_storage_path: str = "session.json"
 
 
 class GlobalSettings(BaseModel):
