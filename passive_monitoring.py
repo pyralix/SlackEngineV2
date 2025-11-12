@@ -182,7 +182,7 @@ class PassiveMessageHandler:
     async def _generate_notification(self, user_question: str, my_response: str) -> str:
         """Generates a first-person notification about the autonomous action."""
         prompt = (
-            "You are an AI assistant. You just responded to a user's question automatically because no one else did. "
+            "You just responded to a user's question automatically because no one else did. "
             "Now, write a brief, first-person notification for an internal channel to explain what happened. "
             "Be friendly and concise.\n\n"
             f"This was the user's question: \"{user_question}\"\n\n"
