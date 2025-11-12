@@ -158,7 +158,9 @@ class PassiveMessageHandler:
 
     async def _is_technical_question(self, message: str) -> bool:
         """Determines if a message is a technical question."""
-        prompt = f"Is the following a technical question that can be answered? Respond with only 'yes' or 'no'.\n\n{message}"
+        prompt = (f"A user has a message that went unanswered by your team. A parser is going to look for your response of 'yes' ro 'no' to decide if you should engage with this user or not.\n"
+                  f"Is the following a technical question that can be answered? Respond with only 'yes' or 'no'.\n"
+                  f"If you respond with anything other than 'yes' or 'no', you will confuse the parser, and may not be able to help the user if they needed it.\n\n{message}")
         response = ""
         async for chunk in self.agent_engine_client.stream_query(None, "passive_monitoring_classifier", prompt):
             response += chunk
@@ -167,8 +169,8 @@ class PassiveMessageHandler:
     async def _generate_response(self, message: str, user_id: str) -> str:
         """Generates a helpful response to a technical question."""
         prompt = (
-            "You are an AI assistant. A user asked a question that has gone unanswered. "
-            "Please provide a helpful, first-person response to their question. "
+            "A user asked a question that has gone unanswered. "
+            "Please provide a helpful, first-person response to their question. Be sure to include links to any referenced documents. "
             "Also, let them know that you have notified your support team and that someone will get back to them if more help is needed."
             f"\n\nHere is the user's question: \"{message}\""
         )
