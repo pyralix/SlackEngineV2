@@ -13,10 +13,15 @@
     "endpoint": "",
     "project": "",
     "location": "",
-    "reasoning_engine_id": "",
-    "session_storage_path": ""
+    "reasoning_engine_id": ""
   },
   "passive_monitoring": {
-    "no_response_timeout_minutes": 480
+    "no_response_timeout_minutes": 480,
+    "channel_mappings": [
+      {
+        "monitored_channel_id": "C1234567890",
+        "notification_channel_id": "C0987654321"
+      }
+    ]
   }
 }

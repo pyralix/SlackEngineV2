@@ -9,14 +9,20 @@ import logging
 from datetime import datetime, timedelta
 from slack_sdk.web.async_client import AsyncWebClient
 from agent_engine_client import AgentEngineClient
+from config_loader import PassiveMonitoringConfig
 
 
 class PassiveMessageHandler:
-    def __init__(self, client: AsyncWebClient, agent_engine_client: AgentEngineClient, config):
+    def __init__(self, client: AsyncWebClient, agent_engine_client: AgentEngineClient, config: PassiveMonitoringConfig):
         self.client = client
         self.agent_engine_client = agent_engine_client
         self.config = config
         self.watched_threads = {}
+        # Create a quick lookup for monitored channels
+        self.monitored_channels = {
+            mapping.monitored_channel_id: mapping.notification_channel_id
+            for mapping in self.config.channel_mappings
+        }
 
     async def handle_message(self, event: dict):
         """
@@ -24,21 +30,27 @@ class PassiveMessageHandler:
         It checks if the message is a candidate for passive monitoring and, if so,
         adds it to the list of watched_threads.
         """
-        # Ignore messages from bots or with mentions
+        channel_id = event.get("channel")
+
+        # 1. Only monitor channels defined in the config
+        if channel_id not in self.monitored_channels:
+            return
+
+        # 2. Ignore messages from bots or with mentions
         if event.get("bot_id") or "<@" in event.get("text", ""):
             return
 
-        # If a message is in a thread, and that thread is being watched, remove it from watched_threads
+        # 3. If a message is a reply in a watched thread, remove it from the watch list
         if event.get("thread_ts"):
-            thread_key = f"{event.get('channel')}-{event.get('thread_ts')}"
+            thread_key = f"{channel_id}-{event.get('thread_ts')}"
             if thread_key in self.watched_threads:
-                # Check if the message is a reply from another user
+                # Check if the reply is from a different user
                 if event.get("user") != self.watched_threads[thread_key]["user_id"]:
                     del self.watched_threads[thread_key]
-                    logging.info(f"Thread {thread_key} has a reply, removing from watch list.")
+                    logging.info(f"Thread {thread_key} received a reply, removing from watch list.")
             return
 
-        channel_id = event.get("channel")
+        # 4. If it's a new message in a monitored channel, add it to the watch list
         message_ts = event.get("ts")
         user_id = event.get("user")
         text = event.get("text")
@@ -54,7 +66,7 @@ class PassiveMessageHandler:
             "text": text,
             "timestamp": datetime.now(),
         }
-        logging.info(f"Watching new thread: {thread_key}")
+        logging.info(f"Watching new thread in channel {channel_id}: {thread_key}")
 
     async def review_watched_threads(self):
         """
@@ -82,13 +94,25 @@ class PassiveMessageHandler:
 
                     # If no replies, check if it's a technical question
                     if await self._is_technical_question(thread_data["text"]):
-                        logging.info(f"Thread {thread_key} is an unanswered technical question.")
+                        logging.info(f"Thread {thread_key} is an unanswered technical question. Responding.")
+                        
+                        # Generate the helpful response for the user
                         response = await self._generate_response(thread_data["text"], thread_data["user_id"])
                         await self.client.chat_postMessage(
                             channel=thread_data["channel_id"],
                             thread_ts=thread_data["thread_ts"],
                             text=f"{response}\n\n(To continue this conversation, please mention me with `@Ask EDE`)"
                         )
+
+                        # Generate and send the notification message
+                        notification_channel_id = self.monitored_channels.get(thread_data["channel_id"])
+                        if notification_channel_id:
+                            notification_text = await self._generate_notification(thread_data["text"], response)
+                            await self.client.chat_postMessage(
+                                channel=notification_channel_id,
+                                text=notification_text
+                            )
+
                 except Exception as e:
                     logging.error(f"Error processing watched thread {thread_key}: {e}")
 
@@ -101,9 +125,9 @@ class PassiveMessageHandler:
         This method uses the agent engine to determine if a message is a
         technical question that the bot can answer.
         """
-        prompt = f"Is the following a technical question that you would like to try answering? Respond with only 'yes' or 'no'.\n\n{message}"
+        prompt = f"Is the following a technical question that can be answered? Respond with only 'yes' or 'no'.\n\n{message}"
         response = ""
-        async for chunk in self.agent_engine_client.stream_query(None, "passive_monitoring", prompt):
+        async for chunk in self.agent_engine_client.stream_query(None, "passive_monitoring_classifier", prompt):
             response += chunk
         return "yes" in response.lower()
 
@@ -117,3 +141,19 @@ class PassiveMessageHandler:
         async for chunk in self.agent_engine_client.stream_query(None, user_id, prompt):
             response += chunk
         return response
+
+    async def _generate_notification(self, user_question: str, my_response: str) -> str:
+        """
+        Generates a first-person notification about the autonomous action taken.
+        """
+        prompt = (
+            "You are an AI assistant. You just responded to a user's question automatically because no one else did. "
+            "Now, write a brief, first-person notification for an internal channel to explain what happened. "
+            "Be friendly and concise.\n\n"
+            f"This was the user's question: \"{user_question}\"\n\n"
+            f"This was your helpful response: \"{my_response}\""
+        )
+        notification = ""
+        async for chunk in self.agent_engine_client.stream_query(None, "passive_monitoring_notifier", prompt):
+            notification += chunk
+        return notification

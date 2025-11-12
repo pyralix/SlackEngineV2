@@ -1,8 +1,9 @@
 """Simplified configuration loader for single bot-agent pair."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import json
 from pathlib import Path
+from typing import List
 
 
 class SlackBotConfig(BaseModel):
@@ -28,9 +29,16 @@ class GlobalSettings(BaseModel):
     session_timeout_minutes: int = 30
 
 
+class ChannelMapping(BaseModel):
+    """Defines a mapping for passive monitoring."""
+    monitored_channel_id: str
+    notification_channel_id: str
+
+
 class PassiveMonitoringConfig(BaseModel):
     """Configuration for passive monitoring."""
-    no_response_timeout_minutes: int = 480  # Default to 8 hours (480 minutes)
+    no_response_timeout_minutes: int = 480  # Default to 8 hours
+    channel_mappings: List[ChannelMapping] = Field(default_factory=list)
 
 
 class Config(BaseModel):
