@@ -39,6 +39,7 @@ class PassiveMonitoringConfig(BaseModel):
     """Configuration for passive monitoring."""
     no_response_timeout_minutes: int = 480  # Default to 8 hours
     channel_mappings: List[ChannelMapping] = Field(default_factory=list)
+    thread_link_storage_path: str = "thread_links.json"
 
 
 class Config(BaseModel):

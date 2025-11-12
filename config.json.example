@@ -22,6 +22,7 @@
         "monitored_channel_id": "C1234567890",
         "notification_channel_id": "C0987654321"
       }
-    ]
+    ],
+    "thread_link_storage_path": "thread_links.json"
   }
 }

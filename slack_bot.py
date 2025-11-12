@@ -31,8 +31,10 @@ class SlackBot:
         self.background_tasks: Set[asyncio.Task] = set()
         self.aiohttp_runner: Optional[web.AppRunner] = None
 
-        # Initialize shared components
-        self.thread_linker = ThreadLinkStorage()
+        # Initialize shared components with configurable paths
+        self.thread_linker = ThreadLinkStorage(
+            path=config.passive_monitoring.thread_link_storage_path
+        )
 
         # Initialize Slack Bolt app
         self.app = AsyncApp(
@@ -82,9 +84,7 @@ class SlackBot:
         @self.app.event("message")
         async def handle_message(event, say, client):
             """Handle incoming messages."""
-            # The EnhancedSlackMessageHandler now handles both relay commands and regular mentions.
             await self.message_handler.handle_message(event, say, client)
-            # The PassiveMessageHandler handles non-mentions in monitored channels.
             await self.passive_message_handler.handle_message(event)
 
         @self.app.event("app_mention")
