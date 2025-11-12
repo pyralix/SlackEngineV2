@@ -13,6 +13,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from agent_engine_client import AgentEngineClient
 from config_loader import PassiveMonitoringConfig
 from thread_link_storage import ThreadLinkStorage
+from slack_message_handler import markdown_to_slack  # Import the formatter
 
 
 class PassiveMessageHandler:
@@ -82,14 +83,12 @@ class PassiveMessageHandler:
         expired_threads = []
         threads_to_keep = {}
 
-        # First, separate expired threads from active ones
         for thread_key, thread_data in self.watched_threads.items():
             if now - thread_data["timestamp"] > timeout:
                 expired_threads.append(thread_data)
             else:
                 threads_to_keep[thread_key] = thread_data
         
-        # Update the watch list to only include active threads
         self.watched_threads = threads_to_keep
 
         if not expired_threads:
@@ -97,10 +96,7 @@ class PassiveMessageHandler:
 
         logging.info(f"Processing {len(expired_threads)} expired threads in parallel.")
         
-        # Create a concurrent task for each expired thread
         tasks = [self._process_single_thread(thread_data) for thread_data in expired_threads]
-        
-        # Run all tasks concurrently
         await asyncio.gather(*tasks)
 
     async def _process_single_thread(self, thread_data: Dict[str, Any]):
@@ -109,7 +105,6 @@ class PassiveMessageHandler:
         """
         thread_key = f"{thread_data['channel_id']}-{thread_data['thread_ts']}"
         try:
-            # Check for replies in the thread
             replies = await self.client.conversations_replies(
                 channel=thread_data["channel_id"],
                 ts=thread_data["thread_ts"],
@@ -119,19 +114,20 @@ class PassiveMessageHandler:
                 logging.info(f"Thread {thread_key} has replies, skipping autonomous response.")
                 return
 
-            # If no replies, check if it's a technical question
             if await self._is_technical_question(thread_data["text"]):
                 logging.info(f"Thread {thread_key} is an unanswered technical question. Responding.")
                 
-                # Generate the helpful response for the user
                 response = await self._generate_response(thread_data["text"], thread_data["user_id"])
+                
+                # Apply markdown formatting before posting
+                formatted_response = markdown_to_slack(response)
+                
                 await self.client.chat_postMessage(
                     channel=thread_data["channel_id"],
                     thread_ts=thread_data["thread_ts"],
-                    text=f"{response}\n\n(To continue this conversation, please mention me with `@Ask EDE`)"
+                    text=f"{formatted_response}\n\n(To continue this conversation, please mention me with `@Ask EDE`)"
                 )
 
-                # Generate and send the notification message
                 notification_channel_id = self.monitored_channels.get(thread_data["channel_id"])
                 if notification_channel_id:
                     notification_text = await self._generate_notification(thread_data["text"], response)
@@ -150,7 +146,6 @@ class PassiveMessageHandler:
                         text=notification_text
                     )
                     
-                    # Link the notification message to the original thread
                     notification_ts = notification_post_response.get("ts")
                     if notification_ts:
                         self.thread_linker.create_link(

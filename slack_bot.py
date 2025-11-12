@@ -31,23 +31,19 @@ class SlackBot:
         self.background_tasks: Set[asyncio.Task] = set()
         self.aiohttp_runner: Optional[web.AppRunner] = None
 
-        # Initialize shared components with configurable paths
         self.thread_linker = ThreadLinkStorage(
             path=config.passive_monitoring.thread_link_storage_path
         )
 
-        # Initialize Slack Bolt app
         self.app = AsyncApp(
             token=config.slack_bot.bot_token,
             signing_secret=config.slack_bot.signing_secret
         )
         
-        # Initialize session manager
         self.session_manager = SessionManager(
             ttl_minutes=config.global_settings.session_timeout_minutes
         )
         
-        # Initialize Agent Engine client
         agent_config = AgentEngineConfig(
             api_key=config.agent_engine.api_key,
             endpoint=config.agent_engine.endpoint,
@@ -58,7 +54,6 @@ class SlackBot:
         )
         self.agent_client = AgentEngineClient(agent_config)
         
-        # Initialize message handlers, passing the shared thread_linker
         self.message_handler = EnhancedSlackMessageHandler(
             self.session_manager,
             self.agent_client,
@@ -73,7 +68,6 @@ class SlackBot:
             thread_linker=self.thread_linker
         )
         
-        # Register event handlers
         self._register_handlers()
         
         self.logger.info(f"Initialized bot '{config.slack_bot.name}' for port {port}")
@@ -83,14 +77,12 @@ class SlackBot:
         
         @self.app.event("message")
         async def handle_message(event, say, client):
-            """Handle incoming messages."""
+            """
+            Handles all incoming messages, including DMs, mentions, and app_mentions.
+            This single handler prevents duplicate processing from separate app_mention events.
+            """
             await self.message_handler.handle_message(event, say, client)
             await self.passive_message_handler.handle_message(event)
-
-        @self.app.event("app_mention")
-        async def handle_app_mention(event, say, client):
-            """Handle app mentions (same as regular messages)."""
-            await self.message_handler.handle_message(event, say, client)
         
         @self.app.event("reaction_added")
         async def handle_reaction_added(event, client):

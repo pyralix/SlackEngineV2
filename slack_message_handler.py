@@ -22,10 +22,10 @@ from deduplication import deduplicate_event
 from gcs_tools import upload_json_to_gcs
 
 
-def remove_slack_mentions(text: str) -> str:
-    """Removes substrings like <@U1A2B3C4> from the input text."""
-    pattern = r'<@[A-Z0-9]+>'
-    return re.sub(pattern, "", text)
+def remove_bot_mention(text: str, bot_user_id: str) -> str:
+    """Removes only the specific bot's mention from text."""
+    pattern = f'<@{bot_user_id}>'
+    return text.replace(pattern, "").strip()
 
 
 def markdown_to_slack(text: str) -> str:
@@ -73,6 +73,19 @@ class EnhancedSlackMessageHandler:
                 self.logger.error(f"Cannot get bot user ID: {e}")
         return self.bot_user_id
 
+    async def _generate_relay_intro(self) -> str:
+        """Generates a varied, first-person intro for a relay message."""
+        prompt = (
+            "You are an AI assistant. You are about to relay a message from a human support agent to a user. "
+            "Write a very brief, friendly, one-sentence introduction. For example: 'I have an update from the team:' "
+            "or 'Here's some more information from the support team:'"
+        )
+        intro = ""
+        # Use a unique user_id for this self-contained task
+        async for chunk in self.agent_client.stream_query(None, "relay_intro_generator", prompt):
+            intro += chunk
+        return intro.strip()
+
     async def _relay_support_message(self, event: dict, client: AsyncWebClient) -> bool:
         """
         Checks if a message is a command in a notification thread and relays it.
@@ -93,8 +106,14 @@ class EnhancedSlackMessageHandler:
 
         original_channel = link_info["original_channel_id"]
         original_thread_ts = link_info["original_thread_ts"]
-        support_message = remove_slack_mentions(text).strip()
-        relay_text = f"Hi there, I've received an update from the support team. They said:\n\n> {support_message}"
+        
+        # Preserve other mentions, remove only the bot's mention
+        support_message = remove_bot_mention(text, bot_user_id)
+
+        # Generate a natural introduction
+        intro = await self._generate_relay_intro()
+        
+        relay_text = f"{intro}\n\n> {support_message}"
 
         try:
             await client.chat_postMessage(channel=original_channel, thread_ts=original_thread_ts, text=relay_text)
@@ -114,6 +133,8 @@ class EnhancedSlackMessageHandler:
     async def handle_message(self, event: dict, say: AsyncSay, client: AsyncWebClient):
         """Handle Slack 'message' event with enhanced logic."""
         try:
+            # This now correctly handles all mentions, including app_mentions,
+            # because we removed the redundant app_mention handler.
             if await self._relay_support_message(event, client):
                 return
 
@@ -129,6 +150,7 @@ class EnhancedSlackMessageHandler:
             channel = event["channel"]
             channel_type = event.get("channel_type", "")
             
+            # The `message` event covers DMs, mentions, and app_mentions.
             should_respond = (channel_type == "im") or (f"<@{bot_user_id}>" in text)
             if not should_respond:
                 return
@@ -203,16 +225,14 @@ class EnhancedSlackMessageHandler:
             if not messages_to_format:
                 return ""
 
-            # Concurrently fetch all unique user emails
             email_tasks = [self._get_user_email(uid, client) for uid in user_ids_to_fetch]
             emails = await asyncio.gather(*email_tasks)
             email_map = dict(zip(user_ids_to_fetch, emails))
 
-            # Format the context string with the pre-fetched emails
             formatted_messages = []
             for msg in messages_to_format:
                 user_email = email_map.get(msg.get("user"), "unknown_user")
-                text = remove_slack_mentions(msg.get("text", "").strip())
+                text = remove_bot_mention(msg.get("text", "").strip(), self.bot_user_id)
                 formatted_messages.append(f"<@{user_email}>: {text}\n")
             
             return "\n".join(formatted_messages)
@@ -225,7 +245,7 @@ class EnhancedSlackMessageHandler:
         """Stream response from Agent Engine and send final reply."""
         response_chunks = []
         try:
-            async for chunk in self.agent_engine_client.stream_query(user_id=user_id, message=context, channel_id=channel_id):
+            async for chunk in self.agent_client.stream_query(user_id=user_id, message=context, channel_id=channel_id):
                 response_chunks.append(chunk)
         except Exception as e:
             self.logger.error(f"Agent Engine streaming error: {e}")
