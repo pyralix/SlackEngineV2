@@ -86,6 +86,11 @@ class SlackBot:
         async def handle_reaction_added(event, client):
             """Handle reactions added to messages."""
             await self.message_handler.handle_reaction_added(event, client)
+
+        @self.app.event("assistant_thread_started")
+        async def handle_assistant_thread_started(event, say, client):
+            """Handle reactions added to messages."""
+            await self.message_handler.handle_assistant_thread_started(event, say, client)
         
         self.logger.info("Registered Slack event handlers")
     
