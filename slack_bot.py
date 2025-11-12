@@ -78,8 +78,9 @@ class SlackBot:
         @self.app.event("message")
         async def handle_message(event, say, client):
             """
-            Handles all incoming messages, including DMs, mentions, and app_mentions.
-            This single handler prevents duplicate processing from separate app_mention events.
+            Handles all incoming messages, including DMs and mentions.
+            The 'message' event is comprehensive and includes app_mentions,
+            so a separate handler is not needed and would cause duplication.
             """
             await self.message_handler.handle_message(event, say, client)
             await self.passive_message_handler.handle_message(event)
