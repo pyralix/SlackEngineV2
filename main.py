@@ -8,7 +8,6 @@ taking the port as a command line argument.
 import argparse
 import asyncio
 import logging
-import signal
 import sys
 from pathlib import Path
 
@@ -49,52 +48,57 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def main():
-    """Main entry point."""
+async def main_async():
+    """Main asynchronous entry point."""
     args = parse_arguments()
-    
+
     # Load configuration
     try:
         config = load_config(args.config)
     except Exception as e:
         print(f"Error loading configuration: {e}")
         sys.exit(1)
-    
+
     # Setup logging
     setup_logging(config.global_settings.log_level)
     logger = logging.getLogger(__name__)
-    
+
     # Validate configuration file exists
     config_path = Path(args.config)
     if not config_path.exists():
         logger.error(f"Configuration file not found: {args.config}")
         sys.exit(1)
-    
-    # Create and start the Slack bot
+
+    # Create the Slack bot
     bot = SlackBot(config, args.port)
     
-    # Setup signal handlers for graceful shutdown
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, initiating shutdown...")
-        bot.stop()
-        sys.exit(0)
-    
-    for sig in [signal.SIGTERM, signal.SIGINT]:
-        signal.signal(sig, signal_handler)
-    
-    logger.info(f"Starting Slack bot '{config.slack_bot.name}' on port {args.port}")
-    logger.info(f"Using configuration: {args.config}")
-    
+    main_task = None
     try:
-        bot.run()
-    except KeyboardInterrupt:
-        logger.info("Shutdown initiated by user")
+        # Create a task for the bot's main run function
+        main_task = asyncio.create_task(bot.start_async())
+        logger.info(f"Starting Slack bot '{config.slack_bot.name}' on port {args.port}")
+        logger.info(f"Using configuration: {args.config}")
+        await main_task
+        
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Shutdown initiated...")
+        
     except Exception as e:
-        logger.error(f"Bot error: {e}")
+        logger.error(f"Bot error: {e}", exc_info=True)
         sys.exit(1)
+        
     finally:
-        logger.info("Slack bot stopped")
+        if main_task and not main_task.done():
+            main_task.cancel()
+        
+        # Ensure graceful shutdown of background tasks
+        await bot.stop()
+        logger.info("Slack bot stopped.")
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main_async())
+    except (KeyboardInterrupt, SystemExit):
+        # This allows Ctrl+C to exit without a traceback
+        pass

@@ -28,11 +28,17 @@ class GlobalSettings(BaseModel):
     session_timeout_minutes: int = 30
 
 
+class PassiveMonitoringConfig(BaseModel):
+    """Configuration for passive monitoring."""
+    no_response_timeout_minutes: int = 480  # Default to 8 hours (480 minutes)
+
+
 class Config(BaseModel):
     """Simplified configuration for single bot-agent pair."""
     global_settings: GlobalSettings
     slack_bot: SlackBotConfig
     agent_engine: AgentEngineConfig
+    passive_monitoring: PassiveMonitoringConfig
 
 
 def load_config(path: str) -> Config:

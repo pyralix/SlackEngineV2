@@ -13,6 +13,10 @@
     "endpoint": "",
     "project": "",
     "location": "",
-    "reasoning_engine_id": ""
+    "reasoning_engine_id": "",
+    "session_storage_path": ""
+  },
+  "passive_monitoring": {
+    "no_response_timeout_minutes": 480
   }
 }
