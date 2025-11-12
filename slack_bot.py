@@ -1,8 +1,5 @@
 """
 Simplified Slack bot runner for single process execution.
-
-This replaces the multi-threaded orchestrator approach with a simple
-single-process Slack bot that connects to one Agent Engine.
 """
 
 import asyncio
@@ -16,30 +13,26 @@ from agent_engine_client import AgentEngineClient, AgentEngineConfig
 from slack_message_handler import EnhancedSlackMessageHandler
 from session_manager import SessionManager
 from passive_monitoring import PassiveMessageHandler
+from thread_link_storage import ThreadLinkStorage
 
 
 class SlackBot:
     """
     Simplified Slack bot that runs in the main process.
-    
-    This class handles a single Slack bot instance connected to one Agent Engine,
-    running the HTTP server in the main process instead of a thread for better
-    Linux compatibility and signal handling.
     """
     
     def __init__(self, config: Config, port: int):
         """
         Initialize the Slack bot.
-        
-        Args:
-            config: Configuration object with bot and agent settings
-            port: Port number for the HTTP server
         """
         self.config = config
         self.port = port
         self.logger = logging.getLogger(f"{__name__}.{config.slack_bot.name}")
         self.background_tasks: Set[asyncio.Task] = set()
         self.aiohttp_runner: Optional[web.AppRunner] = None
+
+        # Initialize shared components
+        self.thread_linker = ThreadLinkStorage()
 
         # Initialize Slack Bolt app
         self.app = AsyncApp(
@@ -63,18 +56,19 @@ class SlackBot:
         )
         self.agent_client = AgentEngineClient(agent_config)
         
-        # Initialize message handler with reaction logging support
+        # Initialize message handlers, passing the shared thread_linker
         self.message_handler = EnhancedSlackMessageHandler(
             self.session_manager,
             self.agent_client,
-            bot_name=config.slack_bot.name
+            bot_name=config.slack_bot.name,
+            thread_linker=self.thread_linker
         )
 
-        # Initialize passive message handler
         self.passive_message_handler = PassiveMessageHandler(
             self.app.client,
             self.agent_client,
-            self.config.passive_monitoring
+            self.config.passive_monitoring,
+            thread_linker=self.thread_linker
         )
         
         # Register event handlers
@@ -88,7 +82,9 @@ class SlackBot:
         @self.app.event("message")
         async def handle_message(event, say, client):
             """Handle incoming messages."""
+            # The EnhancedSlackMessageHandler now handles both relay commands and regular mentions.
             await self.message_handler.handle_message(event, say, client)
+            # The PassiveMessageHandler handles non-mentions in monitored channels.
             await self.passive_message_handler.handle_message(event)
 
         @self.app.event("app_mention")
@@ -115,11 +111,9 @@ class SlackBot:
         """
         self.logger.info(f"Starting Slack bot server on port {self.port}")
         
-        # Start background tasks
         self._create_background_task(self.cleanup_sessions())
         self._create_background_task(self.review_threads_periodically())
 
-        # Manually set up and start the aiohttp server to integrate with the existing event loop
         server = self.app.server(port=self.port, path="/slack/events")
         self.aiohttp_runner = web.AppRunner(server.web_app)
         await self.aiohttp_runner.setup()
@@ -129,7 +123,6 @@ class SlackBot:
         
         self.logger.info("Bolt app is running!")
 
-        # Keep the server running until a cancellation is requested
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -139,7 +132,6 @@ class SlackBot:
         """Stop the Slack bot and its background tasks gracefully."""
         self.logger.info("Stopping Slack bot and background tasks...")
         
-        # Cancel background tasks
         tasks = list(self.background_tasks)
         if tasks:
             self.logger.info(f"Cancelling {len(tasks)} background tasks...")
@@ -148,7 +140,6 @@ class SlackBot:
             await asyncio.gather(*tasks, return_exceptions=True)
             self.logger.info("All background tasks have been cancelled.")
 
-        # Cleanup aiohttp server
         if self.aiohttp_runner:
             await self.aiohttp_runner.cleanup()
             self.logger.info("AIOHTTP server runner cleaned up.")
@@ -157,7 +148,7 @@ class SlackBot:
         """Periodic cleanup of old sessions."""
         while True:
             try:
-                await asyncio.sleep(300)  # Cleanup every 5 minutes
+                await asyncio.sleep(300)
                 cutoff = self.config.global_settings.session_timeout_minutes * 60
                 self.session_manager.purge_old(cutoff)
                 self.logger.debug("Cleaned up old sessions")
@@ -171,7 +162,6 @@ class SlackBot:
         """Periodically review watched threads."""
         while True:
             try:
-                # Review every 5 minutes
                 await asyncio.sleep(300)
                 await self.passive_message_handler.review_watched_threads()
             except asyncio.CancelledError:
