@@ -76,7 +76,7 @@ class EnhancedSlackMessageHandler:
     async def _generate_relay_intro(self) -> str:
         """Generates a varied, first-person intro for a relay message."""
         prompt = (
-            "You are an AI assistant. You are about to relay a message from a human support agent to a user. "
+            "You are about to relay a message from a human support agent to a user. "
             "Write a very brief, friendly, one-sentence introduction. For example: 'I have an update from the team:' "
             "or 'Here's some more information from the support team:'"
         )
@@ -118,7 +118,7 @@ class EnhancedSlackMessageHandler:
         try:
             await client.chat_postMessage(channel=original_channel, thread_ts=original_thread_ts, text=relay_text)
             self.logger.info(f"Successfully relayed message to original thread {original_channel}/{original_thread_ts}")
-            await client.reactions_add(channel=event["channel"], timestamp=event["ts"], name="white_check_mark")
+            # await client.reactions_add(channel=event["channel"], timestamp=event["ts"], name="white_check_mark")
         except SlackApiError as e:
             self.logger.error(f"Failed to relay message: {e}")
             await client.chat_postMessage(

@@ -159,7 +159,7 @@ class PassiveMessageHandler:
     async def _is_technical_question(self, message: str) -> bool:
         """Determines if a message is a technical question."""
         prompt = (f"A user has a message that went unanswered by your team. A parser is going to look for your response of 'yes' ro 'no' to decide if you should engage with this user or not.\n"
-                  f"Is the following a technical question that can be answered? Respond with only 'yes' or 'no'.\n"
+                  f"Is the following a question that you're instructed to answer? Respond with only 'yes' or 'no'.\n"
                   f"If you respond with anything other than 'yes' or 'no', you will confuse the parser, and may not be able to help the user if they needed it.\n\n{message}")
         response = ""
         async for chunk in self.agent_engine_client.stream_query(None, "passive_monitoring_classifier", prompt):
