@@ -14,6 +14,7 @@ from slack_message_handler import EnhancedSlackMessageHandler
 from session_manager import SessionManager
 from passive_monitoring import PassiveMessageHandler
 from thread_link_storage import ThreadLinkStorage
+from metrics_tracker import MetricsCSVTracker
 
 
 class SlackBot:
@@ -31,8 +32,13 @@ class SlackBot:
         self.background_tasks: Set[asyncio.Task] = set()
         self.aiohttp_runner: Optional[web.AppRunner] = None
 
+        # Initialize shared components
         self.thread_linker = ThreadLinkStorage(
             path=config.passive_monitoring.thread_link_storage_path
+        )
+        self.metrics_tracker = MetricsCSVTracker(
+            config=config.metrics,
+            bot_name=config.slack_bot.name
         )
 
         self.app = AsyncApp(
@@ -54,18 +60,21 @@ class SlackBot:
         )
         self.agent_client = AgentEngineClient(agent_config)
         
+        # Initialize message handlers with shared components
         self.message_handler = EnhancedSlackMessageHandler(
-            self.session_manager,
-            self.agent_client,
+            session_mgr=self.session_manager,
+            agent_client=self.agent_client,
             bot_name=config.slack_bot.name,
-            thread_linker=self.thread_linker
+            thread_linker=self.thread_linker,
+            metrics_tracker=self.metrics_tracker
         )
 
         self.passive_message_handler = PassiveMessageHandler(
-            self.app.client,
-            self.agent_client,
-            self.config.passive_monitoring,
-            thread_linker=self.thread_linker
+            client=self.app.client,
+            agent_engine_client=self.agent_client,
+            config=self.config.passive_monitoring,
+            thread_linker=self.thread_linker,
+            metrics_tracker=self.metrics_tracker
         )
         
         self._register_handlers()
@@ -77,31 +86,21 @@ class SlackBot:
         
         @self.app.event("message")
         async def handle_message(event, say, client):
-            """
-            Handles all incoming messages, including DMs and mentions.
-            The 'message' event is comprehensive and includes app_mentions,
-            so a separate handler is not needed and would cause duplication.
-            """
             await self.message_handler.handle_message(event, say, client)
             await self.passive_message_handler.handle_message(event)
         
         @self.app.event("reaction_added")
         async def handle_reaction_added(event, client):
-            """Handle reactions added to messages."""
             await self.message_handler.handle_reaction_added(event, client)
         
         self.logger.info("Registered Slack event handlers")
     
     def _create_background_task(self, coro):
-        """Create and track a background task."""
         task = asyncio.create_task(coro)
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
     async def start_async(self):
-        """
-        Start the Slack bot and background tasks.
-        """
         self.logger.info(f"Starting Slack bot server on port {self.port}")
         
         self._create_background_task(self.cleanup_sessions())
@@ -122,7 +121,6 @@ class SlackBot:
             self.logger.info("Main server task cancelled, initiating shutdown.")
 
     async def stop(self):
-        """Stop the Slack bot and its background tasks gracefully."""
         self.logger.info("Stopping Slack bot and background tasks...")
         
         tasks = list(self.background_tasks)
@@ -138,7 +136,6 @@ class SlackBot:
             self.logger.info("AIOHTTP server runner cleaned up.")
 
     async def cleanup_sessions(self):
-        """Periodic cleanup of old sessions."""
         while True:
             try:
                 await asyncio.sleep(300)
@@ -152,7 +149,6 @@ class SlackBot:
                 self.logger.error(f"Error during session cleanup: {e}")
 
     async def review_threads_periodically(self):
-        """Periodically review watched threads."""
         while True:
             try:
                 await asyncio.sleep(300)

@@ -24,5 +24,11 @@
       }
     ],
     "thread_link_storage_path": "thread_links.json"
+  },
+  "metrics": {
+    "metrics_storage_path": "metrics.csv",
+    "time_saved_per_autonomous_response_minutes": 10,
+    "time_saved_per_direct_mention_minutes": 5,
+    "time_saved_per_relay_minutes": 2
   }
 }

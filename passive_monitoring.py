@@ -13,7 +13,8 @@ from slack_sdk.web.async_client import AsyncWebClient
 from agent_engine_client import AgentEngineClient
 from config_loader import PassiveMonitoringConfig
 from thread_link_storage import ThreadLinkStorage
-from slack_message_handler import markdown_to_slack  # Import the formatter
+from metrics_tracker import MetricsCSVTracker
+from slack_message_handler import markdown_to_slack
 
 
 class PassiveMessageHandler:
@@ -23,13 +24,14 @@ class PassiveMessageHandler:
         agent_engine_client: AgentEngineClient,
         config: PassiveMonitoringConfig,
         thread_linker: ThreadLinkStorage,
+        metrics_tracker: MetricsCSVTracker,
     ):
         self.client = client
         self.agent_engine_client = agent_engine_client
         self.config = config
         self.thread_linker = thread_linker
+        self.metrics_tracker = metrics_tracker
         self.watched_threads = {}
-        # Create a quick lookup for monitored channels
         self.monitored_channels = {
             mapping.monitored_channel_id: mapping.notification_channel_id
             for mapping in self.config.channel_mappings
@@ -37,9 +39,7 @@ class PassiveMessageHandler:
 
     async def handle_message(self, event: dict):
         """
-        This method is called for every message in the channels the bot is in.
-        It checks if the message is a candidate for passive monitoring and, if so,
-        adds it to the list of watched_threads.
+        Checks if a message is a candidate for passive monitoring and adds it to the watch list.
         """
         channel_id = event.get("channel")
 
@@ -54,6 +54,11 @@ class PassiveMessageHandler:
                 if event.get("user") != self.watched_threads[thread_key]["user_id"]:
                     del self.watched_threads[thread_key]
                     logging.info(f"Thread {thread_key} received a reply, removing from watch list.")
+                    self.metrics_tracker.log_event(
+                        "thread_resolved_by_human",
+                        channel_id=channel_id,
+                        thread_ts=event.get("thread_ts"),
+                    )
             return
 
         message_ts = event.get("ts")
@@ -72,6 +77,7 @@ class PassiveMessageHandler:
             "timestamp": datetime.now(),
         }
         logging.info(f"Watching new thread in channel {channel_id}: {thread_key}")
+        self.metrics_tracker.log_event("thread_watched", channel_id=channel_id, thread_ts=message_ts)
 
     async def review_watched_threads(self):
         """
@@ -106,9 +112,7 @@ class PassiveMessageHandler:
         thread_key = f"{thread_data['channel_id']}-{thread_data['thread_ts']}"
         try:
             replies = await self.client.conversations_replies(
-                channel=thread_data["channel_id"],
-                ts=thread_data["thread_ts"],
-                limit=1
+                channel=thread_data["channel_id"], ts=thread_data["thread_ts"], limit=1
             )
             if len(replies.get("messages", [])) > 1:
                 logging.info(f"Thread {thread_key} has replies, skipping autonomous response.")
@@ -118,8 +122,6 @@ class PassiveMessageHandler:
                 logging.info(f"Thread {thread_key} is an unanswered technical question. Responding.")
                 
                 response = await self._generate_response(thread_data["text"], thread_data["user_id"])
-                
-                # Apply markdown formatting before posting
                 formatted_response = markdown_to_slack(response)
                 
                 await self.client.chat_postMessage(
@@ -127,14 +129,20 @@ class PassiveMessageHandler:
                     thread_ts=thread_data["thread_ts"],
                     text=f"{formatted_response}\n\n(To continue this conversation, please mention me with `@Ask EDE`)"
                 )
+                
+                self.metrics_tracker.log_event(
+                    "autonomous_response",
+                    channel_id=thread_data["channel_id"],
+                    thread_ts=thread_data["thread_ts"],
+                    time_saved_minutes=self.metrics_tracker.config.time_saved_per_autonomous_response_minutes,
+                )
 
                 notification_channel_id = self.monitored_channels.get(thread_data["channel_id"])
                 if notification_channel_id:
                     notification_text = await self._generate_notification(thread_data["text"], response)
                     
                     permalink_response = await self.client.chat_getPermalink(
-                        channel=thread_data["channel_id"],
-                        message_ts=thread_data["thread_ts"]
+                        channel=thread_data["channel_id"], message_ts=thread_data["thread_ts"]
                     )
                     permalink = permalink_response.get("permalink")
                     
@@ -142,8 +150,7 @@ class PassiveMessageHandler:
                         notification_text += f"\n\nYou can find the thread here: {permalink}"
 
                     notification_post_response = await self.client.chat_postMessage(
-                        channel=notification_channel_id,
-                        text=notification_text
+                        channel=notification_channel_id, text=notification_text
                     )
                     
                     notification_ts = notification_post_response.get("ts")
@@ -151,26 +158,22 @@ class PassiveMessageHandler:
                         self.thread_linker.create_link(
                             notification_ts=notification_ts,
                             original_channel_id=thread_data["channel_id"],
-                            original_thread_ts=thread_data["thread_ts"]
+                            original_thread_ts=thread_data["thread_ts"],
                         )
         except Exception as e:
             logging.error(f"Error processing watched thread {thread_key}: {e}", exc_info=True)
 
     async def _is_technical_question(self, message: str) -> bool:
-        """Determines if a message is a technical question."""
-        prompt = (f"A user has a message that went unanswered by your team. A parser is going to look for your response of 'yes' ro 'no' to decide if you should engage with this user or not.\n"
-                  f"Is the following a question that you're instructed to answer? Respond with only 'yes' or 'no'.\n"
-                  f"If you respond with anything other than 'yes' or 'no', you will confuse the parser, and may not be able to help the user if they needed it.\n\n{message}")
+        prompt = f"Is the following a technical question that can be answered? Respond with only 'yes' or 'no'.\n\n{message}"
         response = ""
         async for chunk in self.agent_engine_client.stream_query(None, "passive_monitoring_classifier", prompt):
             response += chunk
         return "yes" in response.lower()
 
     async def _generate_response(self, message: str, user_id: str) -> str:
-        """Generates a helpful response to a technical question."""
         prompt = (
-            "A user asked a question that has gone unanswered. "
-            "Please provide a helpful, first-person response to their question. Be sure to include links to any referenced documents. "
+            "You are an AI assistant. A user asked a question that has gone unanswered. "
+            "Please provide a helpful, first-person response to their question. "
             "Also, let them know that you have notified your support team and that someone will get back to them if more help is needed."
             f"\n\nHere is the user's question: \"{message}\""
         )
@@ -180,9 +183,8 @@ class PassiveMessageHandler:
         return response
 
     async def _generate_notification(self, user_question: str, my_response: str) -> str:
-        """Generates a first-person notification about the autonomous action."""
         prompt = (
-            "You just responded to a user's question automatically because no one else did. "
+            "You are an AI assistant. You just responded to a user's question automatically because no one else did. "
             "Now, write a brief, first-person notification for an internal channel to explain what happened. "
             "Be friendly and concise.\n\n"
             f"This was the user's question: \"{user_question}\"\n\n"
