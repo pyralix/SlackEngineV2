@@ -1,8 +1,9 @@
 """Simplified configuration loader for single bot-agent pair."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import json
 from pathlib import Path
+from typing import List
 
 
 class SlackBotConfig(BaseModel):
@@ -28,26 +29,39 @@ class GlobalSettings(BaseModel):
     session_timeout_minutes: int = 30
 
 
+class ChannelMapping(BaseModel):
+    """Defines a mapping for passive monitoring."""
+    monitored_channel_id: str
+    notification_channel_id: str
+
+
+class MetricsConfig(BaseModel):
+    """Configuration for metrics tracking."""
+    metrics_storage_path: str = "metrics.csv"
+    time_saved_per_autonomous_response_minutes: int = 10
+    time_saved_per_direct_mention_minutes: int = 5
+    time_saved_per_relay_minutes: int = 2
+
+
+class PassiveMonitoringConfig(BaseModel):
+    """Configuration for passive monitoring."""
+    no_response_timeout_minutes: int = 480
+    channel_mappings: List[ChannelMapping] = Field(default_factory=list)
+    thread_link_storage_path: str = "thread_links.json"
+
+
 class Config(BaseModel):
     """Simplified configuration for single bot-agent pair."""
     global_settings: GlobalSettings
     slack_bot: SlackBotConfig
     agent_engine: AgentEngineConfig
+    passive_monitoring: PassiveMonitoringConfig
+    metrics: MetricsConfig
 
 
 def load_config(path: str) -> Config:
     """
     Load configuration from JSON file.
-    
-    Args:
-        path: Path to the configuration JSON file
-        
-    Returns:
-        Config: Parsed configuration object
-        
-    Raises:
-        FileNotFoundError: If config file doesn't exist
-        ValueError: If config format is invalid
     """
     config_path = Path(path)
     if not config_path.exists():
