@@ -20,6 +20,7 @@ from agent_engine_client import AgentEngineClient
 from thread_link_storage import ThreadLinkStorage
 from deduplication import deduplicate_event
 from gcs_tools import upload_json_to_gcs
+from metrics_tracker import MetricsCSVTracker
 
 
 def remove_bot_mention(text: str, bot_user_id: str) -> str:
@@ -51,11 +52,13 @@ class EnhancedSlackMessageHandler:
         agent_client: AgentEngineClient,
         bot_name: str,
         thread_linker: ThreadLinkStorage,
+        metrics_tracker: MetricsCSVTracker,
     ):
         self.session_mgr = session_mgr
         self.agent_client = agent_client
         self.bot_name = bot_name
         self.thread_linker = thread_linker
+        self.metrics_tracker = metrics_tracker
         self.logger = logging.getLogger(f"{__name__}.{bot_name}")
         self.bot_user_id: Optional[str] = None
         self.logs_dir = Path("logs")
@@ -63,7 +66,6 @@ class EnhancedSlackMessageHandler:
         self.logger.info(f"Enhanced message handler initialized for {bot_name}")
 
     async def _get_bot_user_id(self, client: AsyncWebClient):
-        """Caches the bot's user ID."""
         if not self.bot_user_id:
             try:
                 auth_response = await client.auth_test()
@@ -74,23 +76,17 @@ class EnhancedSlackMessageHandler:
         return self.bot_user_id
 
     async def _generate_relay_intro(self) -> str:
-        """Generates a varied, first-person intro for a relay message."""
         prompt = (
-            "You are about to relay a message from a human support agent to a user. "
+            "You are an AI assistant. You are about to relay a message from a human support agent to a user. "
             "Write a very brief, friendly, one-sentence introduction. For example: 'I have an update from the team:' "
             "or 'Here's some more information from the support team:'"
         )
         intro = ""
-        # Use a unique user_id for this self-contained task
         async for chunk in self.agent_client.stream_query(None, "relay_intro_generator", prompt):
             intro += chunk
         return intro.strip()
 
     async def _relay_support_message(self, event: dict, client: AsyncWebClient) -> bool:
-        """
-        Checks if a message is a command in a notification thread and relays it.
-        Returns True if the message was relayed, False otherwise.
-        """
         thread_ts = event.get("thread_ts")
         text = event.get("text", "")
         bot_user_id = await self._get_bot_user_id(client)
@@ -106,19 +102,22 @@ class EnhancedSlackMessageHandler:
 
         original_channel = link_info["original_channel_id"]
         original_thread_ts = link_info["original_thread_ts"]
-        
-        # Preserve other mentions, remove only the bot's mention
         support_message = remove_bot_mention(text, bot_user_id)
-
-        # Generate a natural introduction
         intro = await self._generate_relay_intro()
-        
         relay_text = f"{intro}\n\n> {support_message}"
 
         try:
             await client.chat_postMessage(channel=original_channel, thread_ts=original_thread_ts, text=relay_text)
             self.logger.info(f"Successfully relayed message to original thread {original_channel}/{original_thread_ts}")
-            # await client.reactions_add(channel=event["channel"], timestamp=event["ts"], name="white_check_mark")
+            await client.reactions_add(channel=event["channel"], timestamp=event["ts"], name="white_check_mark")
+            
+            self.metrics_tracker.log_event(
+                "support_relay",
+                channel_id=original_channel,
+                thread_ts=original_thread_ts,
+                time_saved_minutes=self.metrics_tracker.config.time_saved_per_relay_minutes,
+            )
+            
         except SlackApiError as e:
             self.logger.error(f"Failed to relay message: {e}")
             await client.chat_postMessage(
@@ -131,10 +130,7 @@ class EnhancedSlackMessageHandler:
 
     @deduplicate_event()
     async def handle_message(self, event: dict, say: AsyncSay, client: AsyncWebClient):
-        """Handle Slack 'message' event with enhanced logic."""
         try:
-            # This now correctly handles all mentions, including app_mentions,
-            # because we removed the redundant app_mention handler.
             if await self._relay_support_message(event, client):
                 return
 
@@ -150,7 +146,6 @@ class EnhancedSlackMessageHandler:
             channel = event["channel"]
             channel_type = event.get("channel_type", "")
             
-            # The `message` event covers DMs, mentions, and app_mentions.
             should_respond = (channel_type == "im") or (f"<@{bot_user_id}>" in text)
             if not should_respond:
                 return
@@ -160,14 +155,18 @@ class EnhancedSlackMessageHandler:
             self.logger.info(f"Processing message from {user_id} in {channel}: {text[:100]}...")
 
             context = await self._get_thread_context(client, channel, thread_ts, raw_user_id)
-            
             text_with_mentions = "<@" + user_id + ">: " + await self.replace_mentions_with_emails(text, client)
             
-            if channel_type == "im":
-                await self._stream_agent_response(text_with_mentions, user_id, thread_ts, say, channel)
-            else:
-                message = f"Additional Thread Context:\n```\n{context}\n```\nUser Message:\n\n{text_with_mentions}" if context else text_with_mentions
-                await self._stream_agent_response(message, thread_ts, thread_ts, say, channel)
+            message = f"Additional Thread Context:\n```\n{context}\n```\nUser Message:\n\n{text_with_mentions}" if context else text_with_mentions
+            
+            await self._stream_agent_response(message, user_id, thread_ts, say, channel)
+            
+            self.metrics_tracker.log_event(
+                "direct_mention_response",
+                channel_id=channel,
+                thread_ts=thread_ts,
+                time_saved_minutes=self.metrics_tracker.config.time_saved_per_direct_mention_minutes,
+            )
 
         except Exception as e:
             self.logger.exception("Error handling Slack message")
@@ -177,7 +176,6 @@ class EnhancedSlackMessageHandler:
                 pass
 
     async def handle_reaction_added(self, event: dict, client: AsyncWebClient):
-        """Logs the entire thread when a reaction is added to a bot message."""
         try:
             bot_user_id = await self._get_bot_user_id(client)
             if not bot_user_id: return
@@ -208,7 +206,6 @@ class EnhancedSlackMessageHandler:
             self.logger.exception("Error handling reaction_added event")
 
     async def _get_thread_context(self, client: AsyncWebClient, channel: str, thread_ts: str, user_id: str) -> str:
-        """Fetch all messages in a thread and format them, fetching user emails concurrently."""
         try:
             history = await client.conversations_replies(channel=channel, ts=thread_ts)
             messages_to_format = []
@@ -242,7 +239,6 @@ class EnhancedSlackMessageHandler:
             return ""
 
     async def _stream_agent_response(self, context: str, user_id: str, thread_ts: str, say: AsyncSay, channel_id: str):
-        """Stream response from Agent Engine and send final reply."""
         response_chunks = []
         try:
             async for chunk in self.agent_client.stream_query(user_id=user_id, message=context, channel_id=channel_id):
@@ -256,7 +252,6 @@ class EnhancedSlackMessageHandler:
         await say(text=markdown_to_slack(final_response), thread_ts=thread_ts)
 
     async def _log_thread_for_review(self, client: AsyncWebClient, channel: str, thread_ts: str, reaction_event: dict):
-        """Log complete thread to a file for human review and trigger analysis."""
         try:
             history_response = await client.conversations_replies(channel=channel, ts=thread_ts)
             messages = history_response.get("messages", [])
@@ -280,12 +275,22 @@ class EnhancedSlackMessageHandler:
             self.logger.info(f"Logged thread to: {log_file_path}")
 
             reaction_response = analyze_log_vertexai_with_json(log_data, reaction_event.get("user"))
+            
+            cleaned_log = remove_friendly_response_field(reaction_response)
+            sentiment = cleaned_log.get("sentiment")
+            if sentiment:
+                self.metrics_tracker.log_event(
+                    "sentiment_recorded",
+                    channel_id=channel,
+                    thread_ts=thread_ts,
+                    sentiment_value=sentiment,
+                )
+
             friendly_message = reaction_response.get("friendly_response_to_user")
             if friendly_message:
                 await client.chat_postMessage(channel=channel, text=friendly_message, thread_ts=thread_ts)
                 self.logger.info(f"Posted friendly feedback message to thread {thread_ts}")
 
-            cleaned_log = remove_friendly_response_field(reaction_response)
             learning_filename = f"learning_{timestamp_str}_{channel}_{thread_ts.replace('.', '_')}.json"
             upload_json_to_gcs(cleaned_log, learning_filename, self.bot_name)
             self.logger.info(f"Uploaded learning log to GCS for thread {thread_ts}")
@@ -294,7 +299,6 @@ class EnhancedSlackMessageHandler:
             self.logger.error(f"Error logging thread for review: {e}")
 
     async def replace_mentions_with_emails(self, text: str, client: AsyncWebClient) -> str:
-        """Replaces all Slack user mentions with their corresponding user emails concurrently."""
         pattern = r'<@([A-Z0-9]+)>'
         user_ids = set(re.findall(pattern, text))
         if not user_ids:
@@ -311,7 +315,6 @@ class EnhancedSlackMessageHandler:
         return re.sub(pattern, replace_mention, text)
 
     async def _get_user_email(self, user_id: str, client: AsyncWebClient) -> str:
-        """Fetch the email address of a Slack user."""
         try:
             response = await client.users_info(user=user_id)
             if response["ok"]:
